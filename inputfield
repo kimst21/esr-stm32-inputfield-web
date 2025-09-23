@@ -1,0 +1,464 @@
+/* USER CODE BEGIN Includes */
+#include "string.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "ctype.h"
+/* USER CODE END Includes */
+
+/* Private variables ---------------------------------------------------------*/
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+#define ESP_RX_BUFFER_SIZE 2048
+#define MAX_FIELD_SIZE 50
+#define MAX_RESPONSE_SIZE 1024
+#define MAX_RETRY_COUNT 3
+
+uint8_t esp_rx_buffer[ESP_RX_BUFFER_SIZE];
+uint16_t esp_rx_index = 0;
+uint8_t uart_rx_byte; // UART 인터럽트용 단일 바이트 버퍼
+
+char received_field1[MAX_FIELD_SIZE] = "";
+char received_field2[MAX_FIELD_SIZE] = "";
+char received_field3[MAX_FIELD_SIZE] = "";
+
+volatile uint8_t new_data_received = 0;
+uint32_t last_activity_time = 0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+void send_AT_command(const char* command, uint32_t delay_ms);
+void clear_esp_rx_buffer(void);
+int wait_for_response(const char* expected_response, uint32_t timeout);
+void parse_form_data(const char* data);
+void safe_strcpy(char* dest, const char* src, size_t dest_size);
+void url_decode(char* str);
+int extract_link_id(const char* ipd_str);
+int send_AT_command_with_response(const char* command, const char* expected_resp, uint32_t timeout);
+void generate_html_response(char* buffer, size_t buffer_size);
+int initialize_esp_wifi(void);
+void handle_http_request(int link_id);
+int is_valid_link_id(int link_id);
+void send_error_response(int link_id);
+/* USER CODE END PFP */
+
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+
+  /* USER CODE BEGIN 2 */
+  // UART 인터럽트 시작
+  HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+  
+  // ESP-01 초기화
+  HAL_Delay(2000);
+  
+  if (!initialize_esp_wifi()) {
+      // 초기화 실패 - LED 등으로 에러 표시 가능
+      while(1) {
+          HAL_Delay(1000);
+      }
+  }
+  
+  last_activity_time = HAL_GetTick();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+      if (new_data_received) {
+          new_data_received = 0;
+          last_activity_time = HAL_GetTick();
+          
+          // IPD 명령어 확인
+          char* ipd_ptr = strstr((const char*)esp_rx_buffer, "+IPD");
+          if (ipd_ptr != NULL) {
+              int link_id = extract_link_id(ipd_ptr);
+              
+              if (is_valid_link_id(link_id)) {
+                  handle_http_request(link_id);
+              }
+              
+              clear_esp_rx_buffer();
+          }
+      }
+      
+      // 주기적인 버퍼 정리 (5초간 활동 없으면)
+      if ((HAL_GetTick() - last_activity_time) > 5000) {
+          clear_esp_rx_buffer();
+          last_activity_time = HAL_GetTick();
+      }
+      
+      HAL_Delay(10);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        if (esp_rx_index < ESP_RX_BUFFER_SIZE - 1) {
+            esp_rx_buffer[esp_rx_index] = uart_rx_byte;
+            esp_rx_index++;
+            esp_rx_buffer[esp_rx_index] = '\0'; // 널 종료 보장
+        } else {
+            // 버퍼 오버플로우 방지 - 순환 버퍼로 동작
+            esp_rx_index = 0;
+            esp_rx_buffer[esp_rx_index] = uart_rx_byte;
+            esp_rx_index++;
+        }
+        
+        new_data_received = 1;
+        
+        // 다음 바이트 수신 준비
+        HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
+    }
+}
+
+int initialize_esp_wifi(void) {
+    int retry_count = 0;
+    
+    // AT 명령어 테스트
+    while (retry_count < MAX_RETRY_COUNT) {
+        if (send_AT_command_with_response("AT", "OK", 2000)) {
+            break;
+        }
+        retry_count++;
+        HAL_Delay(1000);
+    }
+    
+    if (retry_count >= MAX_RETRY_COUNT) {
+        return 0; // ESP 모듈 응답 없음
+    }
+    
+    // 기본 설정
+    send_AT_command("ATE0", 500); // 에코 끄기
+    
+    if (!send_AT_command_with_response("AT+CWMODE=1", "OK", 2000)) {
+        return 0;
+    }
+    
+    // Wi-Fi 연결 (실제 SSID와 비밀번호로 변경 필요)
+    if (!send_AT_command_with_response("AT+CWJAP=\"YOUR_SSID\",\"YOUR_PASSWORD\"", "OK", 15000)) {
+        return 0; // WiFi 연결 실패
+    }
+    
+    // IP 주소 확인
+    clear_esp_rx_buffer();
+    send_AT_command("AT+CIFSR", 1000);
+    wait_for_response("STAIP", 5000);
+    
+    // 서버 설정
+    if (!send_AT_command_with_response("AT+CIPMUX=1", "OK", 2000)) {
+        return 0;
+    }
+    
+    if (!send_AT_command_with_response("AT+CIPSERVER=1,80", "OK", 2000)) {
+        return 0;
+    }
+    
+    clear_esp_rx_buffer();
+    return 1; // 성공
+}
+
+void handle_http_request(int link_id) {
+    if (strstr((const char*)esp_rx_buffer, "GET / HTTP/1.1") != NULL) {
+        // 메인 페이지 요청
+        char html_buffer[MAX_RESPONSE_SIZE];
+        generate_html_response(html_buffer, sizeof(html_buffer));
+        
+        char cmd_buffer[64];
+        int html_len = strlen(html_buffer);
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
+        
+        if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)html_buffer, html_len, 5000);
+            wait_for_response("SEND OK", 3000);
+        }
+    }
+    else if (strstr((const char*)esp_rx_buffer, "GET /submit?") != NULL) {
+        // 폼 데이터 처리
+        char* data_start = strstr((const char*)esp_rx_buffer, "/submit?");
+        if (data_start) {
+            data_start += 8; // "/submit?" 길이만큼 건너뛰기
+            parse_form_data(data_start);
+        }
+        
+        const char* success_html = 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Connection: close\r\n\r\n"
+            "<!DOCTYPE HTML>"
+            "<html><head><meta charset=\"UTF-8\"></head><body>"
+            "<h1>데이터 수신 완료</h1>"
+            "<p>데이터가 성공적으로 처리되었습니다.</p>"
+            "<a href=\"/\">돌아가기</a>"
+            "</body></html>";
+        
+        char cmd_buffer[64];
+        int html_len = strlen(success_html);
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
+        
+        if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
+            HAL_UART_Transmit(&huart2, (uint8_t*)success_html, html_len, 5000);
+            wait_for_response("SEND OK", 3000);
+        }
+    }
+    else {
+        // 알 수 없는 요청 - 404 응답
+        send_error_response(link_id);
+    }
+    
+    // 연결 종료
+    char close_cmd[32];
+    snprintf(close_cmd, sizeof(close_cmd), "AT+CIPCLOSE=%d", link_id);
+    send_AT_command(close_cmd, 500);
+}
+
+void send_error_response(int link_id) {
+    const char* error_html = 
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<!DOCTYPE HTML>"
+        "<html><head><meta charset=\"UTF-8\"></head><body>"
+        "<h1>404 - 페이지를 찾을 수 없습니다</h1>"
+        "<a href=\"/\">홈으로 돌아가기</a>"
+        "</body></html>";
+    
+    char cmd_buffer[64];
+    int html_len = strlen(error_html);
+    snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
+    
+    if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
+        HAL_UART_Transmit(&huart2, (uint8_t*)error_html, html_len, 5000);
+        wait_for_response("SEND OK", 3000);
+    }
+}
+
+int is_valid_link_id(int link_id) {
+    return (link_id >= 0 && link_id <= 4);
+}
+
+void send_AT_command(const char* command, uint32_t delay_ms) {
+    if (!command) return;
+    
+    HAL_UART_Transmit(&huart2, (uint8_t*)command, strlen(command), HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+    HAL_Delay(delay_ms);
+}
+
+void clear_esp_rx_buffer(void) {
+    memset(esp_rx_buffer, 0, ESP_RX_BUFFER_SIZE);
+    esp_rx_index = 0;
+}
+
+int wait_for_response(const char* expected_response, uint32_t timeout) {
+    if (!expected_response) return 0;
+    
+    uint32_t start_time = HAL_GetTick();
+    uint32_t last_data_time = start_time;
+    
+    while ((HAL_GetTick() - start_time) < timeout) {
+        if (esp_rx_index > 0) {
+            last_data_time = HAL_GetTick();
+            
+            if (strstr((const char*)esp_rx_buffer, expected_response) != NULL) {
+                return 1; // 성공
+            }
+            
+            if (strstr((const char*)esp_rx_buffer, "ERROR") != NULL) {
+                return 0; // 실패
+            }
+        }
+        
+        // 일정 시간 동안 데이터가 없으면 종료
+        if ((HAL_GetTick() - last_data_time) > 200) {
+            break;
+        }
+        
+        HAL_Delay(10);
+    }
+    return 0;
+}
+
+void parse_form_data(const char* data) {
+    if (!data || strlen(data) == 0 || strlen(data) >= 256) {
+        return; // 유효성 검사
+    }
+    
+    char temp_data[256];
+    char* token;
+    char* saveptr = NULL;
+    
+    // 안전한 복사
+    strncpy(temp_data, data, sizeof(temp_data) - 1);
+    temp_data[sizeof(temp_data) - 1] = '\0';
+    
+    // HTTP 버전 및 기타 헤더 제거
+    char* http_version = strstr(temp_data, " HTTP/");
+    if (http_version) {
+        *http_version = '\0';
+    }
+    
+    // 줄바꿈 문자 제거
+    char* newline = strchr(temp_data, '\r');
+    if (newline) *newline = '\0';
+    newline = strchr(temp_data, '\n');
+    if (newline) *newline = '\0';
+    
+    // 필드 파싱
+    token = strtok_r(temp_data, "&", &saveptr);
+    while (token != NULL && strlen(token) > 0) {
+        if (strncmp(token, "field1=", 7) == 0) {
+            safe_strcpy(received_field1, token + 7, sizeof(received_field1));
+            url_decode(received_field1);
+        } else if (strncmp(token, "field2=", 7) == 0) {
+            safe_strcpy(received_field2, token + 7, sizeof(received_field2));
+            url_decode(received_field2);
+        } else if (strncmp(token, "field3=", 7) == 0) {
+            safe_strcpy(received_field3, token + 7, sizeof(received_field3));
+            url_decode(received_field3);
+        }
+        token = strtok_r(NULL, "&", &saveptr);
+    }
+}
+
+void safe_strcpy(char* dest, const char* src, size_t dest_size) {
+    if (!dest || !src || dest_size == 0) return;
+    
+    strncpy(dest, src, dest_size - 1);
+    dest[dest_size - 1] = '\0';
+}
+
+void url_decode(char* str) {
+    if (!str) return;
+    
+    char* decoded = str;
+    char* encoded = str;
+    
+    while (*encoded) {
+        if (*encoded == '%' && 
+            encoded[1] && encoded[2] &&
+            isxdigit((unsigned char)encoded[1]) && 
+            isxdigit((unsigned char)encoded[2])) {
+            
+            char hex[3] = {encoded[1], encoded[2], '\0'};
+            int value = (int)strtol(hex, NULL, 16);
+            
+            // 유효한 ASCII 범위인지 확인
+            if (value >= 32 && value <= 126) {
+                *decoded++ = (char)value;
+            } else {
+                *decoded++ = '?'; // 유효하지 않은 문자는 ?로 대체
+            }
+            encoded += 3;
+        } else if (*encoded == '+') {
+            *decoded++ = ' ';
+            encoded++;
+        } else {
+            *decoded++ = *encoded++;
+        }
+    }
+    *decoded = '\0';
+}
+
+int extract_link_id(const char* ipd_str) {
+    if (!ipd_str) return -1;
+    
+    // +IPD,<link_id>,<length>: 형식에서 link_id 추출
+    // +IPD, 다음의 첫 번째 숫자가 link_id
+    char* comma1 = strchr(ipd_str + 4, ',');
+    if (!comma1) return -1;
+    
+    char* comma2 = strchr(comma1 + 1, ',');
+    if (!comma2) return -1;
+    
+    // link_id 추출
+    char link_id_str[8];
+    int len = comma2 - comma1 - 1;
+    if (len <= 0 || len >= sizeof(link_id_str)) return -1;
+    
+    strncpy(link_id_str, comma1 + 1, len);
+    link_id_str[len] = '\0';
+    
+    return atoi(link_id_str);
+}
+
+int send_AT_command_with_response(const char* command, const char* expected_resp, uint32_t timeout) {
+    if (!command || !expected_resp) return 0;
+    
+    clear_esp_rx_buffer();
+    send_AT_command(command, 100);
+    return wait_for_response(expected_resp, timeout);
+}
+
+void generate_html_response(char* buffer, size_t buffer_size) {
+    if (!buffer || buffer_size == 0) return;
+    
+    // HTML 크기 계산 및 안전성 확인
+    int estimated_size = 800 + strlen(received_field1) + strlen(received_field2) + strlen(received_field3);
+    
+    if (estimated_size >= buffer_size) {
+        // 버퍼가 부족한 경우 간단한 응답
+        snprintf(buffer, buffer_size,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Connection: close\r\n\r\n"
+            "<!DOCTYPE HTML>"
+            "<html><body><h1>STM32 Web Server</h1>"
+            "<p>Buffer overflow prevented</p></body></html>");
+        return;
+    }
+    
+    snprintf(buffer, buffer_size,
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        "Connection: close\r\n\r\n"
+        "<!DOCTYPE HTML>"
+        "<html>"
+        "<head>"
+        "<meta charset=\"UTF-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+        "<title>STM32 Web Server</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;margin:20px;}"
+        "input[type=text]{width:200px;padding:5px;margin:5px;}"
+        "input[type=submit]{padding:10px 20px;background:#007bff;color:white;border:none;cursor:pointer;}"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<h1>STM32 웹 서버</h1>"
+        "<form action=\"/submit\" method=\"GET\">"
+        "<label>필드 1: <input type=\"text\" name=\"field1\" maxlength=\"40\"></label><br>"
+        "<label>필드 2: <input type=\"text\" name=\"field2\" maxlength=\"40\"></label><br>"
+        "<label>필드 3: <input type=\"text\" name=\"field3\" maxlength=\"40\"></label><br>"
+        "<input type=\"submit\" value=\"전송\">"
+        "</form>"
+        "<div style=\"margin-top:20px;padding:10px;background:#f8f9fa;border-radius:5px;\">"
+        "<h3>수신된 데이터:</h3>"
+        "<p><strong>Field1:</strong> %.40s</p>"
+        "<p><strong>Field2:</strong> %.40s</p>"
+        "<p><strong>Field3:</strong> %.40s</p>"
+        "</div>"
+        "<p><small>STM32 + ESP-01 웹서버 v1.1</small></p>"
+        "</body></html>",
+        received_field1, received_field2, received_field3);
+}
+/* USER CODE END 4 */
