@@ -548,3 +548,5 @@ void generate_html_response(char* buffer, size_t buffer_size) {
         "</body></html>",
         received_field1, received_field2, received_field3);
 }
+
+/* USER CODE END 4 */
