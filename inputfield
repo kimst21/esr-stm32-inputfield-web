@@ -1,3 +1,15 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : STM32 + ESP-01 웹서버 (모든 버그 수정 버전)
+  * @version        : 2.0
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+
 /* USER CODE BEGIN Includes */
 #include "string.h"
 #include "stdio.h"
@@ -9,15 +21,22 @@
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+// WiFi 설정
+#define WIFI_SSID "YOUR_SSID"
+#define WIFI_PASSWORD "YOUR_PASSWORD"
+
+// 버퍼 크기 설정
 #define ESP_RX_BUFFER_SIZE 2048
 #define MAX_FIELD_SIZE 50
-#define MAX_RESPONSE_SIZE 1024
+#define MAX_RESPONSE_SIZE 2048  // 1024에서 증가
 #define MAX_RETRY_COUNT 3
 
-uint8_t esp_rx_buffer[ESP_RX_BUFFER_SIZE];
-uint16_t esp_rx_index = 0;
-uint8_t uart_rx_byte; // UART 인터럽트용 단일 바이트 버퍼
+// 버퍼 (volatile로 인터럽트 안전성 확보)
+volatile uint8_t esp_rx_buffer[ESP_RX_BUFFER_SIZE];
+volatile uint16_t esp_rx_index = 0;
+uint8_t uart_rx_byte;
 
+// 폼 데이터
 char received_field1[MAX_FIELD_SIZE] = "";
 char received_field2[MAX_FIELD_SIZE] = "";
 char received_field3[MAX_FIELD_SIZE] = "";
@@ -45,14 +64,11 @@ int initialize_esp_wifi(void);
 void handle_http_request(int link_id);
 int is_valid_link_id(int link_id);
 void send_error_response(int link_id);
+void safe_buffer_copy(char* dest, volatile uint8_t* src, size_t max_len);
 /* USER CODE END PFP */
 
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
   HAL_Init();
   SystemClock_Config();
   MX_GPIO_Init();
@@ -62,11 +78,11 @@ int main(void)
   // UART 인터럽트 시작
   HAL_UART_Receive_IT(&huart2, &uart_rx_byte, 1);
   
-  // ESP-01 초기화
   HAL_Delay(2000);
   
+  // ESP-01 초기화
   if (!initialize_esp_wifi()) {
-      // 초기화 실패 - LED 등으로 에러 표시 가능
+      // 초기화 실패 - 무한 루프
       while(1) {
           HAL_Delay(1000);
       }
@@ -76,15 +92,18 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
       if (new_data_received) {
           new_data_received = 0;
           last_activity_time = HAL_GetTick();
           
+          // 임시 버퍼에 안전하게 복사 (인터럽트 경쟁 조건 방지)
+          char temp_buffer[ESP_RX_BUFFER_SIZE];
+          safe_buffer_copy(temp_buffer, esp_rx_buffer, ESP_RX_BUFFER_SIZE);
+          
           // IPD 명령어 확인
-          char* ipd_ptr = strstr((const char*)esp_rx_buffer, "+IPD");
+          char* ipd_ptr = strstr(temp_buffer, "+IPD");
           if (ipd_ptr != NULL) {
               int link_id = extract_link_id(ipd_ptr);
               
@@ -103,26 +122,23 @@ int main(void)
       }
       
       HAL_Delay(10);
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
-  /* USER CODE END 3 */
 }
 
 /* USER CODE BEGIN 4 */
+
+/* ==================== 인터럽트 콜백 ==================== */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART2) {
-        if (esp_rx_index < ESP_RX_BUFFER_SIZE - 1) {
-            esp_rx_buffer[esp_rx_index] = uart_rx_byte;
-            esp_rx_index++;
-            esp_rx_buffer[esp_rx_index] = '\0'; // 널 종료 보장
-        } else {
-            // 버퍼 오버플로우 방지 - 순환 버퍼로 동작
+        // 버퍼 오버플로우 방지
+        if (esp_rx_index >= ESP_RX_BUFFER_SIZE - 1) {
+            // 버퍼 가득 참 - 리셋
             esp_rx_index = 0;
-            esp_rx_buffer[esp_rx_index] = uart_rx_byte;
-            esp_rx_index++;
+            memset((void*)esp_rx_buffer, 0, ESP_RX_BUFFER_SIZE);
         }
+        
+        esp_rx_buffer[esp_rx_index++] = uart_rx_byte;
+        esp_rx_buffer[esp_rx_index] = '\0'; // Null terminator
         
         new_data_received = 1;
         
@@ -131,10 +147,19 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
+/* ==================== 안전한 버퍼 복사 ==================== */
+void safe_buffer_copy(char* dest, volatile uint8_t* src, size_t max_len) {
+    __disable_irq();
+    strncpy(dest, (const char*)src, max_len - 1);
+    dest[max_len - 1] = '\0';
+    __enable_irq();
+}
+
+/* ==================== ESP-01 초기화 ==================== */
 int initialize_esp_wifi(void) {
     int retry_count = 0;
     
-    // AT 명령어 테스트
+    // 1. AT 테스트
     while (retry_count < MAX_RETRY_COUNT) {
         if (send_AT_command_with_response("AT", "OK", 2000)) {
             break;
@@ -144,59 +169,97 @@ int initialize_esp_wifi(void) {
     }
     
     if (retry_count >= MAX_RETRY_COUNT) {
-        return 0; // ESP 모듈 응답 없음
+        return 0;
     }
     
-    // 기본 설정
-    send_AT_command("ATE0", 500); // 에코 끄기
+    // 2. Echo OFF
+    send_AT_command("ATE0", 500);
+    HAL_Delay(500);
     
+    // 3. Station Mode
     if (!send_AT_command_with_response("AT+CWMODE=1", "OK", 2000)) {
         return 0;
     }
+    HAL_Delay(500);
     
-    // Wi-Fi 연결 (실제 SSID와 비밀번호로 변경 필요)
-    if (!send_AT_command_with_response("AT+CWJAP=\"YOUR_SSID\",\"YOUR_PASSWORD\"", "OK", 15000)) {
-        return 0; // WiFi 연결 실패
+    // 4. WiFi 연결 (3회 재시도)
+    retry_count = 0;
+    char wifi_cmd[128];
+    snprintf(wifi_cmd, sizeof(wifi_cmd), "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
+    
+    while (retry_count < 3) {
+        clear_esp_rx_buffer();
+        send_AT_command(wifi_cmd, 1000);
+        
+        if (wait_for_response("WIFI CONNECTED", 20000)) {
+            break;
+        }
+        
+        retry_count++;
+        if (retry_count < 3) {
+            HAL_Delay(3000);
+        }
     }
     
-    // IP 주소 확인
+    if (retry_count >= 3) {
+        return 0;
+    }
+    
+    HAL_Delay(2000);
+    
+    // 5. IP 주소 확인
     clear_esp_rx_buffer();
     send_AT_command("AT+CIFSR", 1000);
     wait_for_response("STAIP", 5000);
+    HAL_Delay(1000);
     
-    // 서버 설정
+    // 6. Multiple connections
     if (!send_AT_command_with_response("AT+CIPMUX=1", "OK", 2000)) {
         return 0;
     }
+    HAL_Delay(500);
     
+    // 7. TCP Server 시작
     if (!send_AT_command_with_response("AT+CIPSERVER=1,80", "OK", 2000)) {
         return 0;
     }
+    HAL_Delay(500);
     
     clear_esp_rx_buffer();
-    return 1; // 성공
+    return 1;
 }
 
+/* ==================== HTTP 요청 처리 ==================== */
 void handle_http_request(int link_id) {
-    if (strstr((const char*)esp_rx_buffer, "GET / HTTP/1.1") != NULL) {
-        // 메인 페이지 요청
+    // 임시 버퍼에 복사
+    char temp_buffer[ESP_RX_BUFFER_SIZE];
+    safe_buffer_copy(temp_buffer, esp_rx_buffer, ESP_RX_BUFFER_SIZE);
+    
+    if (strstr(temp_buffer, "GET / HTTP/1.1") != NULL) {
+        // 메인 페이지
         char html_buffer[MAX_RESPONSE_SIZE];
         generate_html_response(html_buffer, sizeof(html_buffer));
         
         char cmd_buffer[64];
         int html_len = strlen(html_buffer);
+        
+        if (html_len >= MAX_RESPONSE_SIZE) {
+            return; // 안전성 검사
+        }
+        
         snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
         
         if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)html_buffer, html_len, 5000);
-            wait_for_response("SEND OK", 3000);
+            if (HAL_UART_Transmit(&huart2, (uint8_t*)html_buffer, html_len, 5000) == HAL_OK) {
+                wait_for_response("SEND OK", 3000);
+            }
         }
     }
-    else if (strstr((const char*)esp_rx_buffer, "GET /submit?") != NULL) {
+    else if (strstr(temp_buffer, "GET /submit?") != NULL) {
         // 폼 데이터 처리
-        char* data_start = strstr((const char*)esp_rx_buffer, "/submit?");
+        char* data_start = strstr(temp_buffer, "/submit?");
         if (data_start) {
-            data_start += 8; // "/submit?" 길이만큼 건너뛰기
+            data_start += 8;
             parse_form_data(data_start);
         }
         
@@ -205,7 +268,9 @@ void handle_http_request(int link_id) {
             "Content-Type: text/html; charset=UTF-8\r\n"
             "Connection: close\r\n\r\n"
             "<!DOCTYPE HTML>"
-            "<html><head><meta charset=\"UTF-8\"></head><body>"
+            "<html><head><meta charset=\"UTF-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "</head><body>"
             "<h1>데이터 수신 완료</h1>"
             "<p>데이터가 성공적으로 처리되었습니다.</p>"
             "<a href=\"/\">돌아가기</a>"
@@ -216,21 +281,23 @@ void handle_http_request(int link_id) {
         snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
         
         if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
-            HAL_UART_Transmit(&huart2, (uint8_t*)success_html, html_len, 5000);
-            wait_for_response("SEND OK", 3000);
+            if (HAL_UART_Transmit(&huart2, (uint8_t*)success_html, html_len, 5000) == HAL_OK) {
+                wait_for_response("SEND OK", 3000);
+            }
         }
     }
     else {
-        // 알 수 없는 요청 - 404 응답
         send_error_response(link_id);
     }
     
     // 연결 종료
+    HAL_Delay(300);
     char close_cmd[32];
     snprintf(close_cmd, sizeof(close_cmd), "AT+CIPCLOSE=%d", link_id);
     send_AT_command(close_cmd, 500);
 }
 
+/* ==================== 404 에러 응답 ==================== */
 void send_error_response(int link_id) {
     const char* error_html = 
         "HTTP/1.1 404 Not Found\r\n"
@@ -247,28 +314,35 @@ void send_error_response(int link_id) {
     snprintf(cmd_buffer, sizeof(cmd_buffer), "AT+CIPSEND=%d,%d", link_id, html_len);
     
     if (send_AT_command_with_response(cmd_buffer, ">", 2000)) {
-        HAL_UART_Transmit(&huart2, (uint8_t*)error_html, html_len, 5000);
-        wait_for_response("SEND OK", 3000);
+        if (HAL_UART_Transmit(&huart2, (uint8_t*)error_html, html_len, 5000) == HAL_OK) {
+            wait_for_response("SEND OK", 3000);
+        }
     }
 }
 
+/* ==================== Link ID 유효성 검사 ==================== */
 int is_valid_link_id(int link_id) {
     return (link_id >= 0 && link_id <= 4);
 }
 
+/* ==================== AT 명령 전송 ==================== */
 void send_AT_command(const char* command, uint32_t delay_ms) {
     if (!command) return;
     
-    HAL_UART_Transmit(&huart2, (uint8_t*)command, strlen(command), HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart2, (uint8_t*)command, strlen(command), 1000);
+    HAL_UART_Transmit(&huart2, (uint8_t*)"\r\n", 2, 1000);
     HAL_Delay(delay_ms);
 }
 
+/* ==================== 버퍼 클리어 ==================== */
 void clear_esp_rx_buffer(void) {
-    memset(esp_rx_buffer, 0, ESP_RX_BUFFER_SIZE);
+    __disable_irq();
+    memset((void*)esp_rx_buffer, 0, ESP_RX_BUFFER_SIZE);
     esp_rx_index = 0;
+    __enable_irq();
 }
 
+/* ==================== 응답 대기 ==================== */
 int wait_for_response(const char* expected_response, uint32_t timeout) {
     if (!expected_response) return 0;
     
@@ -279,17 +353,21 @@ int wait_for_response(const char* expected_response, uint32_t timeout) {
         if (esp_rx_index > 0) {
             last_data_time = HAL_GetTick();
             
-            if (strstr((const char*)esp_rx_buffer, expected_response) != NULL) {
-                return 1; // 성공
+            // 임시 버퍼에 복사하여 확인
+            char temp_buffer[256];
+            safe_buffer_copy(temp_buffer, esp_rx_buffer, sizeof(temp_buffer));
+            
+            if (strstr(temp_buffer, expected_response) != NULL) {
+                return 1;
             }
             
-            if (strstr((const char*)esp_rx_buffer, "ERROR") != NULL) {
-                return 0; // 실패
+            if (strstr(temp_buffer, "ERROR") != NULL) {
+                return 0;
             }
         }
         
-        // 일정 시간 동안 데이터가 없으면 종료
-        if ((HAL_GetTick() - last_data_time) > 200) {
+        // 데이터 없으면 1초 대기 후 종료 (200ms에서 증가)
+        if ((HAL_GetTick() - last_data_time) > 1000) {
             break;
         }
         
@@ -298,33 +376,33 @@ int wait_for_response(const char* expected_response, uint32_t timeout) {
     return 0;
 }
 
+/* ==================== 폼 데이터 파싱 ==================== */
 void parse_form_data(const char* data) {
     if (!data || strlen(data) == 0 || strlen(data) >= 256) {
-        return; // 유효성 검사
+        return;
     }
     
     char temp_data[256];
     char* token;
-    char* saveptr = NULL;
     
     // 안전한 복사
     strncpy(temp_data, data, sizeof(temp_data) - 1);
     temp_data[sizeof(temp_data) - 1] = '\0';
     
-    // HTTP 버전 및 기타 헤더 제거
+    // HTTP 버전 제거
     char* http_version = strstr(temp_data, " HTTP/");
     if (http_version) {
         *http_version = '\0';
     }
     
-    // 줄바꿈 문자 제거
+    // 줄바꿈 제거
     char* newline = strchr(temp_data, '\r');
     if (newline) *newline = '\0';
     newline = strchr(temp_data, '\n');
     if (newline) *newline = '\0';
     
-    // 필드 파싱
-    token = strtok_r(temp_data, "&", &saveptr);
+    // strtok 사용 (strtok_r 대신)
+    token = strtok(temp_data, "&");
     while (token != NULL && strlen(token) > 0) {
         if (strncmp(token, "field1=", 7) == 0) {
             safe_strcpy(received_field1, token + 7, sizeof(received_field1));
@@ -336,10 +414,11 @@ void parse_form_data(const char* data) {
             safe_strcpy(received_field3, token + 7, sizeof(received_field3));
             url_decode(received_field3);
         }
-        token = strtok_r(NULL, "&", &saveptr);
+        token = strtok(NULL, "&");
     }
 }
 
+/* ==================== 안전한 문자열 복사 ==================== */
 void safe_strcpy(char* dest, const char* src, size_t dest_size) {
     if (!dest || !src || dest_size == 0) return;
     
@@ -347,6 +426,7 @@ void safe_strcpy(char* dest, const char* src, size_t dest_size) {
     dest[dest_size - 1] = '\0';
 }
 
+/* ==================== URL 디코딩 ==================== */
 void url_decode(char* str) {
     if (!str) return;
     
@@ -362,11 +442,11 @@ void url_decode(char* str) {
             char hex[3] = {encoded[1], encoded[2], '\0'};
             int value = (int)strtol(hex, NULL, 16);
             
-            // 유효한 ASCII 범위인지 확인
+            // 유효한 ASCII 범위 확인
             if (value >= 32 && value <= 126) {
                 *decoded++ = (char)value;
             } else {
-                *decoded++ = '?'; // 유효하지 않은 문자는 ?로 대체
+                *decoded++ = '?';
             }
             encoded += 3;
         } else if (*encoded == '+') {
@@ -379,28 +459,23 @@ void url_decode(char* str) {
     *decoded = '\0';
 }
 
+/* ==================== Link ID 추출 (수정됨) ==================== */
 int extract_link_id(const char* ipd_str) {
     if (!ipd_str) return -1;
     
-    // +IPD,<link_id>,<length>: 형식에서 link_id 추출
-    // +IPD, 다음의 첫 번째 숫자가 link_id
-    char* comma1 = strchr(ipd_str + 4, ',');
-    if (!comma1) return -1;
+    // +IPD,0,123:GET... 형식
+    // +IPD, 다음의 첫 번째 문자가 link_id
+    char* comma = strchr(ipd_str, ',');
+    if (!comma) return -1;
     
-    char* comma2 = strchr(comma1 + 1, ',');
-    if (!comma2) return -1;
+    // 쉼표 다음 문자 확인
+    char id_char = *(comma + 1);
+    if (id_char < '0' || id_char > '4') return -1;
     
-    // link_id 추출
-    char link_id_str[8];
-    int len = comma2 - comma1 - 1;
-    if (len <= 0 || len >= sizeof(link_id_str)) return -1;
-    
-    strncpy(link_id_str, comma1 + 1, len);
-    link_id_str[len] = '\0';
-    
-    return atoi(link_id_str);
+    return id_char - '0';
 }
 
+/* ==================== AT 명령 + 응답 확인 ==================== */
 int send_AT_command_with_response(const char* command, const char* expected_resp, uint32_t timeout) {
     if (!command || !expected_resp) return 0;
     
@@ -409,21 +484,21 @@ int send_AT_command_with_response(const char* command, const char* expected_resp
     return wait_for_response(expected_resp, timeout);
 }
 
+/* ==================== HTML 생성 ==================== */
 void generate_html_response(char* buffer, size_t buffer_size) {
-    if (!buffer || buffer_size == 0) return;
+    if (!buffer || buffer_size < 100) return;
     
-    // HTML 크기 계산 및 안전성 확인
-    int estimated_size = 800 + strlen(received_field1) + strlen(received_field2) + strlen(received_field3);
-    
-    if (estimated_size >= buffer_size) {
-        // 버퍼가 부족한 경우 간단한 응답
+    // 안전성 확인
+    int field_total = strlen(received_field1) + strlen(received_field2) + strlen(received_field3);
+    if (field_total > 300) {
+        // 필드 데이터가 너무 길면 간단한 응답
         snprintf(buffer, buffer_size,
             "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Content-Type: text/html\r\n"
             "Connection: close\r\n\r\n"
-            "<!DOCTYPE HTML>"
-            "<html><body><h1>STM32 Web Server</h1>"
-            "<p>Buffer overflow prevented</p></body></html>");
+            "<!DOCTYPE HTML><html><body>"
+            "<h1>STM32 Web Server</h1>"
+            "<p>Data too long</p></body></html>");
         return;
     }
     
@@ -435,30 +510,41 @@ void generate_html_response(char* buffer, size_t buffer_size) {
         "<html>"
         "<head>"
         "<meta charset=\"UTF-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\">"
         "<title>STM32 Web Server</title>"
         "<style>"
-        "body{font-family:Arial,sans-serif;margin:20px;}"
-        "input[type=text]{width:200px;padding:5px;margin:5px;}"
-        "input[type=submit]{padding:10px 20px;background:#007bff;color:white;border:none;cursor:pointer;}"
+        "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5;}"
+        ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 5px rgba(0,0,0,0.1);}"
+        "h1{color:#333;}"
+        "input[type=text]{width:100%%;padding:8px;margin:5px 0;box-sizing:border-box;border:1px solid #ddd;border-radius:4px;}"
+        "input[type=submit]{width:100%%;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer;font-size:16px;}"
+        "input[type=submit]:hover{background:#0056b3;}"
+        ".data-box{background:#f8f9fa;padding:15px;margin-top:20px;border-radius:5px;}"
+        ".data-box h3{margin-top:0;color:#555;}"
+        ".data-box p{margin:5px 0;}"
         "</style>"
         "</head>"
         "<body>"
+        "<div class=\"container\">"
         "<h1>STM32 웹 서버</h1>"
         "<form action=\"/submit\" method=\"GET\">"
-        "<label>필드 1: <input type=\"text\" name=\"field1\" maxlength=\"40\"></label><br>"
-        "<label>필드 2: <input type=\"text\" name=\"field2\" maxlength=\"40\"></label><br>"
-        "<label>필드 3: <input type=\"text\" name=\"field3\" maxlength=\"40\"></label><br>"
+        "<label>필드 1:</label>"
+        "<input type=\"text\" name=\"field1\" maxlength=\"40\"><br>"
+        "<label>필드 2:</label>"
+        "<input type=\"text\" name=\"field2\" maxlength=\"40\"><br>"
+        "<label>필드 3:</label>"
+        "<input type=\"text\" name=\"field3\" maxlength=\"40\"><br>"
         "<input type=\"submit\" value=\"전송\">"
         "</form>"
-        "<div style=\"margin-top:20px;padding:10px;background:#f8f9fa;border-radius:5px;\">"
+        "<div class=\"data-box\">"
         "<h3>수신된 데이터:</h3>"
-        "<p><strong>Field1:</strong> %.40s</p>"
-        "<p><strong>Field2:</strong> %.40s</p>"
-        "<p><strong>Field3:</strong> %.40s</p>"
+        "<p><strong>Field 1:</strong> %.40s</p>"
+        "<p><strong>Field 2:</strong> %.40s</p>"
+        "<p><strong>Field 3:</strong> %.40s</p>"
         "</div>"
-        "<p><small>STM32 + ESP-01 웹서버 v1.1</small></p>"
+        "<p style=\"text-align:center;color:#999;margin-top:20px;\">"
+        "<small>STM32 + ESP-01 v2.0</small></p>"
+        "</div>"
         "</body></html>",
         received_field1, received_field2, received_field3);
 }
-/* USER CODE END 4 */
